@@ -33,6 +33,7 @@ APEX_MIN_BARS    = 5
 APEX_MAX_BARS    = 50
 MIN_COMPRESSION  = 0.30
 ALERT_COOLDOWN   = 4 * 3600
+TOP_REFRESH      = 12 * 3600   # top 100 리스트 갱신 주기
 CONCURRENCY      = 5
 GATE             = "https://api.gateio.ws"
 
@@ -60,23 +61,45 @@ log = logging.getLogger("tri")
 
 
 # ========== State ==========
+# state.json 스키마:
+#   {
+#     "cooldowns": {"BTC_USDT|15m": 1712345678.0, ...},
+#     "top": {"ts": 1712345678.0, "symbols": ["BTC_USDT", ...]}
+#   }
+
 def load_state() -> dict:
+    default = {"cooldowns": {}, "top": {"ts": 0.0, "symbols": []}}
     if not STATE_PATH.exists():
-        return {}
+        return default
     try:
         with STATE_PATH.open("r", encoding="utf-8") as f:
             data = json.load(f)
-        return {k: float(v) for k, v in data.items() if isinstance(v, (int, float))}
+        if not isinstance(data, dict):
+            return default
+        cooldowns = {}
+        raw_cd = data.get("cooldowns", {})
+        if isinstance(raw_cd, dict):
+            cooldowns = {k: float(v) for k, v in raw_cd.items() if isinstance(v, (int, float))}
+        top_raw = data.get("top") or {}
+        top = {
+            "ts": float(top_raw.get("ts", 0) or 0),
+            "symbols": list(top_raw.get("symbols") or []),
+        }
+        return {"cooldowns": cooldowns, "top": top}
     except Exception as e:
         log.warning(f"state.json 로드 실패 ({e}), 빈 상태로 시작")
-        return {}
+        return default
 
 
 def save_state(state: dict) -> None:
     cutoff = datetime.now(timezone.utc).timestamp() - ALERT_COOLDOWN * 6
-    trimmed = {k: v for k, v in state.items() if v >= cutoff}
+    cooldowns = {k: v for k, v in state.get("cooldowns", {}).items() if v >= cutoff}
+    out = {
+        "cooldowns": cooldowns,
+        "top": state.get("top", {"ts": 0.0, "symbols": []}),
+    }
     with STATE_PATH.open("w", encoding="utf-8") as f:
-        json.dump(trimmed, f, indent=2, sort_keys=True)
+        json.dump(out, f, indent=2, sort_keys=True)
 
 
 # ========== Gate.io API (v4) ==========
@@ -424,9 +447,22 @@ async def send_discord_webhook(session, hits, timeframe):
 
 # ========== 메인 ==========
 async def run_once():
-    seen = load_state()
+    state = load_state()
+    cooldowns = state["cooldowns"]
+    top = state["top"]
+
     async with aiohttp.ClientSession() as session:
-        symbols = await get_top_symbols(session, TOP_N)
+        now_ts = datetime.now(timezone.utc).timestamp()
+        age = now_ts - (top.get("ts") or 0)
+        cached = top.get("symbols") or []
+        if cached and age < TOP_REFRESH:
+            symbols = cached
+            log.info(f"top100 캐시 사용 (갱신 {age/3600:.1f}h 전, 다음 갱신까지 {(TOP_REFRESH-age)/3600:.1f}h)")
+        else:
+            symbols = await get_top_symbols(session, TOP_N)
+            top = {"ts": now_ts, "symbols": symbols}
+            log.info(f"top100 신규 조회: {len(symbols)}개 저장")
+
         sem = asyncio.Semaphore(CONCURRENCY)
 
         for tf in TIMEFRAMES:
@@ -443,14 +479,14 @@ async def run_once():
             fresh = []
             for h in hits:
                 key = f"{h['symbol']}|{tf}"
-                if now - seen.get(key, 0) > ALERT_COOLDOWN:
-                    seen[key] = now
+                if now - cooldowns.get(key, 0) > ALERT_COOLDOWN:
+                    cooldowns[key] = now
                     fresh.append(h)
 
             log.info(f"[{tf}] 감지 {len(hits)}건 / 신규 알림 {len(fresh)}건")
             await send_discord_webhook(session, fresh, tf)
 
-    save_state(seen)
+    save_state({"cooldowns": cooldowns, "top": top})
 
 
 def main():
