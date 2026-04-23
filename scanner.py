@@ -146,10 +146,11 @@ async def get_klines(session, symbol, timeframe, limit):
     if not data:
         raise RuntimeError("empty klines")
     # Gate.io는 시간순(과거→최신)으로 반환, 객체 배열
+    opens  = np.array([float(c["o"]) for c in data], dtype=float)
     highs  = np.array([float(c["h"]) for c in data], dtype=float)
     lows   = np.array([float(c["l"]) for c in data], dtype=float)
     closes = np.array([float(c["c"]) for c in data], dtype=float)
-    return highs, lows, closes
+    return opens, highs, lows, closes
 
 
 # ========== 삼각형 감지 ==========
@@ -241,28 +242,118 @@ def detect_triangle(highs, lows, closes):
         "compression": float(compression),
         "hi_r2": float(hi_r2),
         "lo_r2": float(lo_r2),
+        "hi_slope": float(hi_slope),
+        "hi_intercept": float(hi_b),
+        "lo_slope": float(lo_slope),
+        "lo_intercept": float(lo_b),
+        "piv_hi": [int(i) for i in piv_hi],
+        "piv_lo": [int(i) for i in piv_lo],
     }
 
 
 async def scan_symbol(session, symbol, timeframe):
     try:
-        highs, lows, closes = await get_klines(session, symbol, timeframe, KLINE_LIMIT)
+        opens, highs, lows, closes = await get_klines(session, symbol, timeframe, KLINE_LIMIT)
         result = detect_triangle(highs, lows, closes)
         if result:
             result["symbol"] = symbol
             result["timeframe"] = timeframe
+            result["_opens"] = opens
+            result["_highs"] = highs
+            result["_lows"] = lows
+            result["_closes"] = closes
             return result
     except Exception as e:
         log.warning(f"{symbol} [{timeframe}]: {e}")
     return None
 
 
+# ========== 차트 렌더 ==========
+def render_chart(h) -> bytes:
+    import io
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    opens  = h["_opens"]
+    highs  = h["_highs"]
+    lows   = h["_lows"]
+    closes = h["_closes"]
+    n = len(closes)
+    ext = int(h["bars_to_apex"])
+
+    # 삼각형 구조가 시작된 지점 기준으로 zoom-in
+    first_piv = min(h["piv_hi"][0], h["piv_lo"][0])
+    left = max(0, first_piv - 10)
+    right = n + ext + 2
+
+    fig, ax = plt.subplots(figsize=(9, 4.5), dpi=110)
+
+    # --- 캔들봉 ---
+    width = 0.7
+    for i in range(n):
+        o, c, hi, lo = opens[i], closes[i], highs[i], lows[i]
+        up = c >= o
+        color = "#26a69a" if up else "#ef5350"
+        # 심지 (high-low)
+        ax.vlines(i, lo, hi, color=color, linewidth=0.9, zorder=2)
+        # 몸통 (open-close)
+        body_lo, body_hi = (o, c) if up else (c, o)
+        height = body_hi - body_lo
+        if height == 0:
+            height = (hi - lo) * 0.02 or 1e-9
+        ax.add_patch(plt.Rectangle(
+            (i - width/2, body_lo), width, height,
+            facecolor=color, edgecolor=color, linewidth=0.6, zorder=3,
+        ))
+
+    # --- 추세선 (피벗 시작점부터 apex까지만) ---
+    line_start = first_piv
+    xs = np.arange(line_start, n + ext + 1)
+    upper_line = h["hi_slope"] * xs + h["hi_intercept"]
+    lower_line = h["lo_slope"] * xs + h["lo_intercept"]
+    ax.plot(xs, upper_line, color="#d62728", linewidth=1.5, linestyle="--")
+    ax.plot(xs, lower_line, color="#2ca02c", linewidth=1.5, linestyle="--")
+
+    # --- 피벗 점 ---
+    ax.scatter(h["piv_hi"], [highs[i] for i in h["piv_hi"]],
+               color="#d62728", s=30, zorder=6, edgecolors="white", linewidths=0.8)
+    ax.scatter(h["piv_lo"], [lows[i]  for i in h["piv_lo"]],
+               color="#2ca02c", s=30, zorder=6, edgecolors="white", linewidths=0.8)
+
+    # --- Apex 지점 표시 ---
+    apex_x = n - 1 + ext
+    apex_y = (h["hi_slope"] * apex_x + h["hi_intercept"] + h["lo_slope"] * apex_x + h["lo_intercept"]) / 2
+    ax.scatter([apex_x], [apex_y], marker="*", s=140, color="#f39c12", zorder=7, edgecolors="black", linewidths=0.5)
+
+    # --- 현재봉 세로선 ---
+    ax.axvline(n - 1, color="#3498db", linewidth=0.8, alpha=0.5, linestyle=":")
+
+    type_en = {"대칭": "Symmetrical", "상승": "Ascending", "하강": "Descending"}.get(h["type"], h["type"])
+    ax.set_title(
+        f"{_display_symbol(h['symbol'])} | {h['timeframe']} | {type_en} "
+        f"(comp {h['compression']*100:.0f}%, apex in {ext} bars)"
+    )
+    ax.grid(True, alpha=0.25)
+    ax.set_xlim(left, right)
+    visible_slice = slice(left, min(n, right))
+    y_min = min(lows[visible_slice].min(), lower_line.min())
+    y_max = max(highs[visible_slice].max(), upper_line.max())
+    pad = (y_max - y_min) * 0.05
+    ax.set_ylim(y_min - pad, y_max + pad)
+    ax.set_xlabel("bars")
+    ax.set_facecolor("#fafafa")
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format="png", bbox_inches="tight")
+    plt.close(fig)
+    return buf.getvalue()
+
+
 # ========== Discord ==========
-def build_embeds(hits, timeframe):
-    hits_sorted = sorted(hits, key=lambda x: -x["compression"])
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+def build_embeds(hits_sorted, timeframe, now_str):
     embeds = []
-    for h in hits_sorted[:10]:  # Discord 한 메시지 최대 10 embed
+    for idx, h in enumerate(hits_sorted):
         contract = h["symbol"]
         url = f"https://www.gate.io/futures/USDT/{contract}"
         embeds.append({
@@ -270,14 +361,15 @@ def build_embeds(hits, timeframe):
             "url": url,
             "color": TYPE_COLORS.get(h["type"], 0x95A5A6),
             "fields": [
-                {"name": "현재가",  "value": f"{h['price']:.6g}", "inline": True},
-                {"name": "범위",    "value": f"{h['lower']:.4g} ~ {h['upper']:.4g}", "inline": True},
-                {"name": "Apex",    "value": f"{h['bars_to_apex']}봉 후", "inline": True},
-                {"name": "수렴률",  "value": f"{h['compression']*100:.0f}%", "inline": True},
+                {"name": "현재가",     "value": f"{h['price']:.6g}", "inline": True},
+                {"name": "범위",       "value": f"{h['lower']:.4g} ~ {h['upper']:.4g}", "inline": True},
+                {"name": "Apex",       "value": f"{h['bars_to_apex']}봉 후", "inline": True},
+                {"name": "수렴률",     "value": f"{h['compression']*100:.0f}%", "inline": True},
                 {"name": "R² (상/하)", "value": f"{h['hi_r2']:.2f} / {h['lo_r2']:.2f}", "inline": True},
-                {"name": "TF",      "value": timeframe, "inline": True},
+                {"name": "TF",         "value": timeframe, "inline": True},
             ],
-            "footer": {"text": now},
+            "image": {"url": f"attachment://chart_{idx}.png"},
+            "footer": {"text": now_str},
         })
     return embeds
 
@@ -295,19 +387,37 @@ async def send_discord_webhook(session, hits, timeframe):
             )
         return
 
+    hits_sorted = sorted(hits, key=lambda x: -x["compression"])[:10]
+    now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     content = f"🔺 **Triangle Scan** [{timeframe}] — {len(hits)}건 감지"
-    embeds = build_embeds(hits, timeframe)
+    embeds = build_embeds(hits_sorted, timeframe, now_str)
+
+    form = aiohttp.FormData()
+    form.add_field(
+        "payload_json",
+        json.dumps({"content": content, "embeds": embeds}),
+        content_type="application/json",
+    )
+    for idx, h in enumerate(hits_sorted):
+        try:
+            png = render_chart(h)
+        except Exception as e:
+            log.error(f"차트 렌더 실패 {h['symbol']}: {e}")
+            continue
+        form.add_field(
+            f"files[{idx}]",
+            png,
+            filename=f"chart_{idx}.png",
+            content_type="image/png",
+        )
+
     try:
-        async with session.post(
-            WEBHOOK_URL,
-            json={"content": content, "embeds": embeds},
-            timeout=15,
-        ) as r:
+        async with session.post(WEBHOOK_URL, data=form, timeout=30) as r:
             if r.status >= 300:
                 text = await r.text()
                 log.error(f"Discord 전송 실패 {r.status}: {text}")
             else:
-                log.info(f"Discord 알림 전송: {len(embeds)} embed")
+                log.info(f"Discord 알림 전송: {len(embeds)} embed + 차트")
     except Exception as e:
         log.error(f"Discord 전송 예외: {e}")
 
