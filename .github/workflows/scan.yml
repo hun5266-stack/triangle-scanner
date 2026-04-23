@@ -5,6 +5,9 @@ on:
     - cron: "*/15 * * * *"
   workflow_dispatch:
 
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 concurrency:
   group: triangle-scan
   cancel-in-progress: false
