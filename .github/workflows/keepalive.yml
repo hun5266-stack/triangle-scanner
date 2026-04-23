@@ -1,0 +1,28 @@
+name: Keepalive
+
+# GitHub은 repo에 60일간 활동이 없으면 스케줄 워크플로우를 일시정지한다.
+# 이 워크플로우는 매월 1일에 .keepalive 파일의 타임스탬프만 업데이트해
+# "활동 있음" 상태를 유지시킨다.
+
+on:
+  schedule:
+    - cron: "0 3 1 * *"   # 매월 1일 03:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Bump timestamp
+        run: |
+          date -u +"%Y-%m-%dT%H:%M:%SZ" > .keepalive
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .keepalive
+          git diff --cached --quiet || git commit -m "chore: keepalive bump"
+          git push
