@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Bybit USDT Perpetual Futures — Triangle Convergence Scanner (GitHub Actions edition)
+Gate.io USDT Perpetual Futures — Triangle Convergence Scanner (GitHub Actions edition)
 
 - 1회 스캔 후 종료 (스케줄은 Actions cron이 담당)
 - Discord 웹훅으로 Embed 알림 전송
@@ -33,14 +33,13 @@ APEX_MIN_BARS    = 5
 APEX_MAX_BARS    = 50
 MIN_COMPRESSION  = 0.30
 ALERT_COOLDOWN   = 4 * 3600
-CONCURRENCY      = 10
-BYBIT            = "https://api.bybit.com"
+CONCURRENCY      = 5
+GATE             = "https://api.gateio.ws"
 
-# Bybit v5 kline interval: 분단위는 숫자, 일/주/월은 문자
+# Gate.io는 소문자 그대로 사용
 INTERVAL_MAP = {
-    "1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
-    "1h": "60", "2h": "120", "4h": "240", "6h": "360", "12h": "720",
-    "1d": "D", "1w": "W", "1M": "M",
+    "1m": "1m", "5m": "5m", "15m": "15m", "30m": "30m",
+    "1h": "1h", "4h": "4h", "8h": "8h", "1d": "1d", "7d": "7d",
 }
 
 STATE_PATH = Path(os.getenv("STATE_PATH", "state.json"))
@@ -80,71 +79,76 @@ def save_state(state: dict) -> None:
         json.dump(trimmed, f, indent=2, sort_keys=True)
 
 
-# ========== Bybit API (v5) ==========
-async def fetch_json(session, url, params=None):
-    async with session.get(url, params=params, timeout=15) as r:
-        r.raise_for_status()
-        data = await r.json()
-    if isinstance(data, dict) and data.get("retCode") not in (0, None):
-        raise RuntimeError(f"Bybit API error {data.get('retCode')}: {data.get('retMsg')}")
-    return data
+# ========== Gate.io API (v4) ==========
+async def fetch_json(session, url, params=None, retries=5):
+    delay = 0.5
+    last_exc = None
+    for _ in range(retries):
+        try:
+            async with session.get(url, params=params, timeout=15) as r:
+                if r.status == 429:
+                    await asyncio.sleep(delay)
+                    delay = min(delay * 2, 8.0)
+                    continue
+                r.raise_for_status()
+                return await r.json()
+        except aiohttp.ClientResponseError as e:
+            last_exc = e
+            if e.status == 429:
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 8.0)
+                continue
+            raise
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("fetch_json: exhausted retries")
+
+
+def _display_symbol(contract: str) -> str:
+    """BTC_USDT → BTCUSDT (표시용)."""
+    return contract.replace("_", "")
 
 
 async def get_top_symbols(session, n=TOP_N):
-    info = await fetch_json(
+    """Gate.io USDT 무기한 선물 중 24시간 quote 거래대금 상위 N개 contract 반환."""
+    contracts = await fetch_json(
         session,
-        f"{BYBIT}/v5/market/instruments-info",
-        params={"category": "linear", "limit": 1000},
+        f"{GATE}/api/v4/futures/usdt/contracts",
     )
-    perps = set()
-    for s in info.get("result", {}).get("list", []):
-        if s.get("contractType") != "LinearPerpetual":
-            continue
-        if s.get("quoteCoin") != "USDT":
-            continue
-        if s.get("status") != "Trading":
-            continue
-        perps.add(s["symbol"])
+    active = {
+        c["name"] for c in contracts
+        if not c.get("in_delisting", False) and c["name"].endswith("_USDT")
+    }
 
     tickers = await fetch_json(
         session,
-        f"{BYBIT}/v5/market/tickers",
-        params={"category": "linear"},
+        f"{GATE}/api/v4/futures/usdt/tickers",
     )
-    rows = [t for t in tickers.get("result", {}).get("list", []) if t["symbol"] in perps]
+    rows = [t for t in tickers if t["contract"] in active]
 
     def _vol(t):
         try:
-            return float(t.get("turnover24h") or 0)
+            return float(t.get("volume_24h_quote") or 0)
         except (TypeError, ValueError):
             return 0.0
 
     rows.sort(key=_vol, reverse=True)
-    return [t["symbol"] for t in rows[:n]]
+    return [t["contract"] for t in rows[:n]]
 
 
 async def get_klines(session, symbol, timeframe, limit):
     interval = INTERVAL_MAP.get(timeframe, timeframe)
     data = await fetch_json(
         session,
-        f"{BYBIT}/v5/market/kline",
-        params={
-            "category": "linear",
-            "symbol": symbol,
-            "interval": interval,
-            "limit": limit,
-        },
+        f"{GATE}/api/v4/futures/usdt/candlesticks",
+        params={"contract": symbol, "interval": interval, "limit": limit},
     )
-    rows = data.get("result", {}).get("list", [])
-    if not rows:
+    if not data:
         raise RuntimeError("empty klines")
-    # Bybit는 최신→과거 순으로 반환 → 시간순으로 뒤집기
-    rows = list(reversed(rows))
-    arr = np.array(rows, dtype=object)
-    # [start, open, high, low, close, volume, turnover]
-    highs  = arr[:, 2].astype(float)
-    lows   = arr[:, 3].astype(float)
-    closes = arr[:, 4].astype(float)
+    # Gate.io는 시간순(과거→최신)으로 반환, 객체 배열
+    highs  = np.array([float(c["h"]) for c in data], dtype=float)
+    lows   = np.array([float(c["l"]) for c in data], dtype=float)
+    closes = np.array([float(c["c"]) for c in data], dtype=float)
     return highs, lows, closes
 
 
@@ -259,9 +263,10 @@ def build_embeds(hits, timeframe):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     embeds = []
     for h in hits_sorted[:10]:  # Discord 한 메시지 최대 10 embed
-        url = f"https://www.bybit.com/trade/usdt/{h['symbol']}"
+        contract = h["symbol"]
+        url = f"https://www.gate.io/futures/USDT/{contract}"
         embeds.append({
-            "title": f"{h['symbol']} · {h['type']}",
+            "title": f"{_display_symbol(contract)} · {h['type']}",
             "url": url,
             "color": TYPE_COLORS.get(h["type"], 0x95A5A6),
             "fields": [
