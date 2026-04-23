@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Binance USDT-M Perpetual Futures — Triangle Convergence Scanner (GitHub Actions edition)
+Bybit USDT Perpetual Futures — Triangle Convergence Scanner (GitHub Actions edition)
 
 - 1회 스캔 후 종료 (스케줄은 Actions cron이 담당)
 - Discord 웹훅으로 Embed 알림 전송
@@ -34,7 +34,14 @@ APEX_MAX_BARS    = 50
 MIN_COMPRESSION  = 0.30
 ALERT_COOLDOWN   = 4 * 3600
 CONCURRENCY      = 10
-FAPI             = "https://fapi.binance.com"
+BYBIT            = "https://api.bybit.com"
+
+# Bybit v5 kline interval: 분단위는 숫자, 일/주/월은 문자
+INTERVAL_MAP = {
+    "1m": "1", "3m": "3", "5m": "5", "15m": "15", "30m": "30",
+    "1h": "60", "2h": "120", "4h": "240", "6h": "360", "12h": "720",
+    "1d": "D", "1w": "W", "1M": "M",
+}
 
 STATE_PATH = Path(os.getenv("STATE_PATH", "state.json"))
 WEBHOOK_URL = os.getenv("DISCORD_WEBHOOK_URL")
@@ -73,34 +80,68 @@ def save_state(state: dict) -> None:
         json.dump(trimmed, f, indent=2, sort_keys=True)
 
 
-# ========== Binance API ==========
+# ========== Bybit API (v5) ==========
 async def fetch_json(session, url, params=None):
     async with session.get(url, params=params, timeout=15) as r:
         r.raise_for_status()
-        return await r.json()
+        data = await r.json()
+    if isinstance(data, dict) and data.get("retCode") not in (0, None):
+        raise RuntimeError(f"Bybit API error {data.get('retCode')}: {data.get('retMsg')}")
+    return data
 
 
 async def get_top_symbols(session, n=TOP_N):
-    info = await fetch_json(session, f"{FAPI}/fapi/v1/exchangeInfo")
-    perps = {
-        s["symbol"] for s in info["symbols"]
-        if s.get("contractType") == "PERPETUAL"
-        and s.get("quoteAsset") == "USDT"
-        and s.get("status") == "TRADING"
-    }
-    tickers = await fetch_json(session, f"{FAPI}/fapi/v1/ticker/24hr")
-    tickers = [t for t in tickers if t["symbol"] in perps]
-    tickers.sort(key=lambda t: float(t["quoteVolume"]), reverse=True)
-    return [t["symbol"] for t in tickers[:n]]
+    info = await fetch_json(
+        session,
+        f"{BYBIT}/v5/market/instruments-info",
+        params={"category": "linear", "limit": 1000},
+    )
+    perps = set()
+    for s in info.get("result", {}).get("list", []):
+        if s.get("contractType") != "LinearPerpetual":
+            continue
+        if s.get("quoteCoin") != "USDT":
+            continue
+        if s.get("status") != "Trading":
+            continue
+        perps.add(s["symbol"])
+
+    tickers = await fetch_json(
+        session,
+        f"{BYBIT}/v5/market/tickers",
+        params={"category": "linear"},
+    )
+    rows = [t for t in tickers.get("result", {}).get("list", []) if t["symbol"] in perps]
+
+    def _vol(t):
+        try:
+            return float(t.get("turnover24h") or 0)
+        except (TypeError, ValueError):
+            return 0.0
+
+    rows.sort(key=_vol, reverse=True)
+    return [t["symbol"] for t in rows[:n]]
 
 
-async def get_klines(session, symbol, interval, limit):
+async def get_klines(session, symbol, timeframe, limit):
+    interval = INTERVAL_MAP.get(timeframe, timeframe)
     data = await fetch_json(
         session,
-        f"{FAPI}/fapi/v1/klines",
-        params={"symbol": symbol, "interval": interval, "limit": limit},
+        f"{BYBIT}/v5/market/kline",
+        params={
+            "category": "linear",
+            "symbol": symbol,
+            "interval": interval,
+            "limit": limit,
+        },
     )
-    arr = np.array(data, dtype=object)
+    rows = data.get("result", {}).get("list", [])
+    if not rows:
+        raise RuntimeError("empty klines")
+    # Bybit는 최신→과거 순으로 반환 → 시간순으로 뒤집기
+    rows = list(reversed(rows))
+    arr = np.array(rows, dtype=object)
+    # [start, open, high, low, close, volume, turnover]
     highs  = arr[:, 2].astype(float)
     lows   = arr[:, 3].astype(float)
     closes = arr[:, 4].astype(float)
@@ -218,7 +259,7 @@ def build_embeds(hits, timeframe):
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
     embeds = []
     for h in hits_sorted[:10]:  # Discord 한 메시지 최대 10 embed
-        url = f"https://www.binance.com/en/futures/{h['symbol']}"
+        url = f"https://www.bybit.com/trade/usdt/{h['symbol']}"
         embeds.append({
             "title": f"{h['symbol']} · {h['type']}",
             "url": url,
