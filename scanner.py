@@ -22,15 +22,16 @@ import aiohttp
 import numpy as np
 
 # ========== 설정 ==========
-TIMEFRAMES       = ["15m", "30m"]
+TIMEFRAMES       = ["30m"]
 KLINE_LIMIT      = 200
 TOP_N            = 100
-PIVOT_LOOKBACK   = 3
-MIN_PIVOTS       = 3
-MIN_R2           = 0.85
+# 멀티 윈도우 스캔: (윈도우 길이, 피벗 lookback) 튜플 리스트
+SCAN_WINDOWS     = [(30, 1), (60, 2), (120, 2)]
+MIN_PIVOTS       = 2
+MIN_R2           = 0.60
 FLAT_SLOPE_PCT   = 0.0003
 APEX_MIN_BARS    = 5
-APEX_MAX_BARS    = 50
+APEX_MAX_BARS    = 30
 MIN_COMPRESSION  = 0.30
 ALERT_COOLDOWN   = 4 * 3600
 TOP_REFRESH      = 12 * 3600   # top 100 리스트 갱신 주기
@@ -202,24 +203,18 @@ def fit_line(x, y):
     return slope, intercept, r2
 
 
-def detect_triangle(highs, lows, closes):
+def detect_triangle(highs, lows, closes, pivot_lookback=2):
     n = len(closes)
     price = closes[-1]
 
-    # 종가 전체 추세가 너무 강하면 "횡보 수렴" 아님 → 탈락
-    close_fit = fit_line(np.arange(n), closes)
-    if close_fit:
-        close_slope, _, _ = close_fit
-        if abs(close_slope / price) > FLAT_SLOPE_PCT * 2:   # 봉당 >0.06% 드리프트 차단
-            return None
-
-    piv_hi = find_pivots(highs, PIVOT_LOOKBACK, "high")
-    piv_lo = find_pivots(lows, PIVOT_LOOKBACK, "low")
+    piv_hi = find_pivots(highs, pivot_lookback, "high")
+    piv_lo = find_pivots(lows, pivot_lookback, "low")
     if len(piv_hi) < MIN_PIVOTS or len(piv_lo) < MIN_PIVOTS:
         return None
 
-    piv_hi = piv_hi[-5:]
-    piv_lo = piv_lo[-5:]
+    # 최근 피벗만 사용 (추세선은 최근 흐름에 맞춰)
+    piv_hi = piv_hi[-3:]
+    piv_lo = piv_lo[-3:]
 
     hi = fit_line(piv_hi, [highs[i] for i in piv_hi])
     lo = fit_line(piv_lo, [lows[i]  for i in piv_lo])
@@ -297,15 +292,24 @@ def detect_triangle(highs, lows, closes):
 async def scan_symbol(session, symbol, timeframe):
     try:
         opens, highs, lows, closes = await get_klines(session, symbol, timeframe, KLINE_LIMIT)
-        result = detect_triangle(highs, lows, closes)
-        if result:
-            result["symbol"] = symbol
-            result["timeframe"] = timeframe
-            result["_opens"] = opens
-            result["_highs"] = highs
-            result["_lows"] = lows
-            result["_closes"] = closes
-            return result
+        # 멀티 윈도우 스캔: 짧은 → 긴 순서. 첫 감지에서 반환 (쿨다운은 symbol|tf 단위).
+        for wlen, lookback in SCAN_WINDOWS:
+            if len(closes) < wlen:
+                continue
+            w_opens  = opens[-wlen:]
+            w_highs  = highs[-wlen:]
+            w_lows   = lows[-wlen:]
+            w_closes = closes[-wlen:]
+            result = detect_triangle(w_highs, w_lows, w_closes, pivot_lookback=lookback)
+            if result:
+                result["symbol"] = symbol
+                result["timeframe"] = timeframe
+                result["window"] = wlen
+                result["_opens"] = w_opens
+                result["_highs"] = w_highs
+                result["_lows"] = w_lows
+                result["_closes"] = w_closes
+                return result
     except Exception as e:
         log.warning(f"{symbol} [{timeframe}]: {e}")
     return None
