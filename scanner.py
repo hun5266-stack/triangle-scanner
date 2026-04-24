@@ -206,6 +206,13 @@ def detect_triangle(highs, lows, closes):
     n = len(closes)
     price = closes[-1]
 
+    # 종가 전체 추세가 너무 강하면 "횡보 수렴" 아님 → 탈락
+    close_fit = fit_line(np.arange(n), closes)
+    if close_fit:
+        close_slope, _, _ = close_fit
+        if abs(close_slope / price) > FLAT_SLOPE_PCT * 2:   # 봉당 >0.06% 드리프트 차단
+            return None
+
     piv_hi = find_pivots(highs, PIVOT_LOOKBACK, "high")
     piv_lo = find_pivots(lows, PIVOT_LOOKBACK, "low")
     if len(piv_hi) < MIN_PIVOTS or len(piv_lo) < MIN_PIVOTS:
@@ -223,14 +230,27 @@ def detect_triangle(highs, lows, closes):
     if hi_r2 < MIN_R2 or lo_r2 < MIN_R2:
         return None
 
-    hi_flat = abs(hi_slope / price) < FLAT_SLOPE_PCT
-    lo_flat = abs(lo_slope / price) < FLAT_SLOPE_PCT
+    # 정규화 기울기 (봉당 가격변화율)
+    hi_norm = hi_slope / price
+    lo_norm = lo_slope / price
 
-    if hi_slope < 0 and lo_slope > 0:
+    T = FLAT_SLOPE_PCT              # 0.03%/bar  — "유의미한 기울기" 기준
+    WEDGE_EPS = T * 0.3             # 0.01%/bar  — "같은 방향 미세 기울기" 허용폭
+
+    hi_strong_down = hi_norm < -T
+    lo_strong_up   = lo_norm >  T
+
+    # 상승 삼각형: 상단이 평평 (|hi| < T) AND 위로 유의미하게 오르면 안 됨
+    #   → hi_norm <= WEDGE_EPS (살짝 하강 쪽은 허용, 상승은 미량만)
+    hi_flat_asc = abs(hi_norm) < T and hi_norm <= WEDGE_EPS
+    # 하강 삼각형: 하단이 평평 AND 아래로 유의미하게 내려가면 안 됨
+    lo_flat_desc = abs(lo_norm) < T and lo_norm >= -WEDGE_EPS
+
+    if hi_strong_down and lo_strong_up:
         tri_type = "대칭"
-    elif hi_flat and lo_slope > 0:
+    elif hi_flat_asc and lo_strong_up:
         tri_type = "상승"
-    elif hi_slope < 0 and lo_flat:
+    elif hi_strong_down and lo_flat_desc:
         tri_type = "하강"
     else:
         return None
