@@ -479,7 +479,6 @@ def build_embeds(hits_sorted, timeframe, now_str):
         contract = h["symbol"]
         url = f"https://www.gate.io/futures/USDT/{contract}"
         arrow = "⬆" if h.get("impulse_dir") == "up" else "⬇"
-        impulse_str = f"{arrow} {h.get('impulse_ratio', 0):.2f}배"
 
         # 품질 체크 (필터 아님, 표시용)
         imp_pct = h.get("impulse_pct", 0)
@@ -507,7 +506,6 @@ def build_embeds(hits_sorted, timeframe, now_str):
                 {"name": "범위",       "value": f"{h['lower']:.4g} ~ {h['upper']:.4g}", "inline": True},
                 {"name": "Apex",       "value": f"{h['bars_to_apex']}봉 후", "inline": True},
                 {"name": "수렴률",     "value": f"{h['compression']*100:.0f}%", "inline": True},
-                {"name": "장대/수렴폭",  "value": impulse_str, "inline": True},
                 {"name": "TF",         "value": timeframe, "inline": True},
                 {"name": f"품질 체크 ({score}/3)", "value": quality_value, "inline": False},
             ],
