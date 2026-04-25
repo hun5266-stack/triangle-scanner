@@ -33,6 +33,11 @@ FLAT_SLOPE_PCT   = 0.0008       # 상단/하단 "평평"의 허용 기울기 (�
 APEX_MIN_BARS    = 5
 APEX_MAX_BARS    = 30
 MIN_COMPRESSION  = 0.30
+# 장대 필터: 수렴 시작 직전 변곡점에서 수렴 시작점까지의
+# (꼬리 포함) 가격 폭이 수렴 박스 시작폭의 IMPULSE_RATIO_MIN배 이상
+SWING_LOOKBACK   = 5            # 변곡 정의: 좌우 5봉 둘러봐 최고/최저
+IMPULSE_MAX_BACK = 80           # 수렴 시작 직전 최대 80봉까지 변곡 탐색
+IMPULSE_RATIO_MIN = 0.9         # 장대폭 ≥ 0.9 × 수렴박스 시작폭
 ALERT_COOLDOWN   = 4 * 3600
 TOP_REFRESH      = 12 * 3600   # top 100 리스트 갱신 주기
 CONCURRENCY      = 5
@@ -289,27 +294,84 @@ def detect_triangle(highs, lows, closes, pivot_lookback=2):
     }
 
 
+def find_swing_before(highs, lows, conv_start_g, lookback=SWING_LOOKBACK, max_back=IMPULSE_MAX_BACK):
+    """conv_start_g(글로벌 인덱스) 직전, max_back 봉 안에서 가장 최근 swing pivot 반환.
+    좌우 lookback봉 모두보다 높/낮은 봉. (idx, 'high'|'low', price) or None."""
+    last = None
+    lo_i = max(lookback, conv_start_g - max_back)
+    hi_i = conv_start_g - lookback
+    for i in range(lo_i, hi_i):
+        wh = highs[i - lookback : i + lookback + 1]
+        wl = lows[i - lookback : i + lookback + 1]
+        if highs[i] == wh.max():
+            last = (i, "high", float(highs[i]))
+        if lows[i] == wl.min():
+            last = (i, "low", float(lows[i]))
+    return last
+
+
+def check_impulse(highs, lows, end_g, wlen, result):
+    """장대 필터. end_g는 윈도우 끝 글로벌 인덱스 (exclusive).
+    True면 통과, dict에 impulse 정보 추가."""
+    win_start_g = end_g - wlen
+    conv_start_local = min(result["piv_hi"][0], result["piv_lo"][0])
+    conv_start_g = win_start_g + conv_start_local
+
+    sw = find_swing_before(highs, lows, conv_start_g)
+    if not sw:
+        return False
+    sw_idx, sw_kind, sw_price = sw
+
+    # 장대폭 = 변곡~수렴시작 구간 high-low (꼬리 포함)
+    seg_h = float(highs[sw_idx : conv_start_g + 1].max())
+    seg_l = float(lows[sw_idx : conv_start_g + 1].min())
+    impulse_size = seg_h - seg_l
+
+    # 수렴 박스 시작폭
+    upper_at_start = result["hi_slope"] * conv_start_local + result["hi_intercept"]
+    lower_at_start = result["lo_slope"] * conv_start_local + result["lo_intercept"]
+    sq_start_width = upper_at_start - lower_at_start
+    if sq_start_width <= 0:
+        return False
+
+    ratio = impulse_size / sq_start_width
+    if ratio < IMPULSE_RATIO_MIN:
+        return False
+
+    result["impulse_ratio"] = float(ratio)
+    result["impulse_dir"]   = "down" if sw_kind == "high" else "up"
+    result["impulse_high"]  = seg_h
+    result["impulse_low"]   = seg_l
+    result["swing_idx_local"] = int(sw_idx - win_start_g)  # 윈도우 내 상대 인덱스 (음수 가능)
+    return True
+
+
 async def scan_symbol(session, symbol, timeframe):
     try:
         opens, highs, lows, closes = await get_klines(session, symbol, timeframe, KLINE_LIMIT)
+        n = len(closes)
         # 멀티 윈도우 스캔: 짧은 → 긴 순서. 첫 감지에서 반환 (쿨다운은 symbol|tf 단위).
         for wlen, lookback in SCAN_WINDOWS:
-            if len(closes) < wlen:
+            if n < wlen:
                 continue
             w_opens  = opens[-wlen:]
             w_highs  = highs[-wlen:]
             w_lows   = lows[-wlen:]
             w_closes = closes[-wlen:]
             result = detect_triangle(w_highs, w_lows, w_closes, pivot_lookback=lookback)
-            if result:
-                result["symbol"] = symbol
-                result["timeframe"] = timeframe
-                result["window"] = wlen
-                result["_opens"] = w_opens
-                result["_highs"] = w_highs
-                result["_lows"] = w_lows
-                result["_closes"] = w_closes
-                return result
+            if not result:
+                continue
+            # 장대 필터
+            if not check_impulse(highs, lows, n, wlen, result):
+                continue
+            result["symbol"] = symbol
+            result["timeframe"] = timeframe
+            result["window"] = wlen
+            result["_opens"] = w_opens
+            result["_highs"] = w_highs
+            result["_lows"] = w_lows
+            result["_closes"] = w_closes
+            return result
     except Exception as e:
         log.warning(f"{symbol} [{timeframe}]: {e}")
     return None
@@ -403,8 +465,10 @@ def build_embeds(hits_sorted, timeframe, now_str):
     for idx, h in enumerate(hits_sorted):
         contract = h["symbol"]
         url = f"https://www.gate.io/futures/USDT/{contract}"
+        arrow = "⬆" if h.get("impulse_dir") == "up" else "⬇"
+        impulse_str = f"{arrow} {h.get('impulse_ratio', 0):.2f}배"
         embeds.append({
-            "title": f"{_display_symbol(contract)} · {h['type']}",
+            "title": f"{_display_symbol(contract)} · {h['type']} · {arrow}장대후 수렴",
             "url": url,
             "color": TYPE_COLORS.get(h["type"], 0x95A5A6),
             "fields": [
@@ -412,7 +476,7 @@ def build_embeds(hits_sorted, timeframe, now_str):
                 {"name": "범위",       "value": f"{h['lower']:.4g} ~ {h['upper']:.4g}", "inline": True},
                 {"name": "Apex",       "value": f"{h['bars_to_apex']}봉 후", "inline": True},
                 {"name": "수렴률",     "value": f"{h['compression']*100:.0f}%", "inline": True},
-                {"name": "R² (상/하)", "value": f"{h['hi_r2']:.2f} / {h['lo_r2']:.2f}", "inline": True},
+                {"name": "장대/수렴폭",  "value": impulse_str, "inline": True},
                 {"name": "TF",         "value": timeframe, "inline": True},
             ],
             "image": {"url": f"attachment://chart_{idx}.png"},
