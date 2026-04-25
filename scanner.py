@@ -23,13 +23,13 @@ import numpy as np
 
 # ========== 설정 ==========
 TIMEFRAMES       = ["30m"]
-KLINE_LIMIT      = 200
+KLINE_LIMIT      = 1000         # 30m × 1000 ≈ 20일
 TOP_N            = 100
 # 멀티 윈도우 스캔: (윈도우 길이, 피벗 lookback) 튜플 리스트
 SCAN_WINDOWS     = [(30, 1), (60, 2), (120, 2)]
 MIN_PIVOTS       = 2
-MIN_R2           = 0.60
-FLAT_SLOPE_PCT   = 0.0003
+MIN_R2           = 0.40         # 3피벗 이상일 때만 적용, 2피벗이면 R²=1이라 자동 통과
+FLAT_SLOPE_PCT   = 0.0008       # 상단/하단 "평평"의 허용 기울기 (봉당 0.08%)
 APEX_MIN_BARS    = 5
 APEX_MAX_BARS    = 30
 MIN_COMPRESSION  = 0.30
