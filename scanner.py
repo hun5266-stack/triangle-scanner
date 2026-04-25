@@ -38,6 +38,10 @@ MIN_COMPRESSION  = 0.30
 SWING_LOOKBACK   = 5            # 변곡 정의: 좌우 5봉 둘러봐 최고/최저
 IMPULSE_MAX_BACK = 80           # 수렴 시작 직전 최대 80봉까지 변곡 탐색
 IMPULSE_RATIO_MIN = 0.9         # 장대폭 ≥ 0.9 × 수렴박스 시작폭
+# 품질 체크 임계값 (필터 아님, 알림에 ✓/✗만 표시)
+QUALITY_IMPULSE_PCT = 5.0       # 임펄스 % 변동률
+QUALITY_VOL_RATIO   = 1.5       # 장대 평균 거래량 / 수렴 평균 거래량
+QUALITY_SHORT_WINDOW = 30       # 짧은 패턴 = 30봉 윈도우
 ALERT_COOLDOWN   = 4 * 3600
 TOP_REFRESH      = 12 * 3600   # top 100 리스트 갱신 주기
 CONCURRENCY      = 5
@@ -175,11 +179,12 @@ async def get_klines(session, symbol, timeframe, limit):
     if not data:
         raise RuntimeError("empty klines")
     # Gate.io는 시간순(과거→최신)으로 반환, 객체 배열
-    opens  = np.array([float(c["o"]) for c in data], dtype=float)
-    highs  = np.array([float(c["h"]) for c in data], dtype=float)
-    lows   = np.array([float(c["l"]) for c in data], dtype=float)
-    closes = np.array([float(c["c"]) for c in data], dtype=float)
-    return opens, highs, lows, closes
+    opens   = np.array([float(c["o"]) for c in data], dtype=float)
+    highs   = np.array([float(c["h"]) for c in data], dtype=float)
+    lows    = np.array([float(c["l"]) for c in data], dtype=float)
+    closes  = np.array([float(c["c"]) for c in data], dtype=float)
+    volumes = np.array([float(c.get("v", 0)) for c in data], dtype=float)
+    return opens, highs, lows, closes, volumes
 
 
 # ========== 삼각형 감지 ==========
@@ -310,7 +315,7 @@ def find_swing_before(highs, lows, conv_start_g, lookback=SWING_LOOKBACK, max_ba
     return last
 
 
-def check_impulse(highs, lows, end_g, wlen, result):
+def check_impulse(highs, lows, volumes, end_g, wlen, result):
     """장대 필터. end_g는 윈도우 끝 글로벌 인덱스 (exclusive).
     True면 통과, dict에 impulse 정보 추가."""
     win_start_g = end_g - wlen
@@ -338,17 +343,25 @@ def check_impulse(highs, lows, end_g, wlen, result):
     if ratio < IMPULSE_RATIO_MIN:
         return False
 
+    # 품질 지표 (필터 X, 알림에 표시용)
+    impulse_pct = (seg_h - seg_l) / seg_l * 100 if seg_l > 0 else 0
+    vol_imp = float(volumes[sw_idx : conv_start_g + 1].mean()) if conv_start_g >= sw_idx else 0
+    vol_sq  = float(volumes[conv_start_g : end_g].mean()) if end_g > conv_start_g else 0
+    vol_ratio = (vol_imp / vol_sq) if vol_sq > 0 else 0.0
+
     result["impulse_ratio"] = float(ratio)
     result["impulse_dir"]   = "down" if sw_kind == "high" else "up"
     result["impulse_high"]  = seg_h
     result["impulse_low"]   = seg_l
-    result["swing_idx_local"] = int(sw_idx - win_start_g)  # 윈도우 내 상대 인덱스 (음수 가능)
+    result["impulse_pct"]   = float(impulse_pct)
+    result["vol_ratio"]     = float(vol_ratio)
+    result["swing_idx_local"] = int(sw_idx - win_start_g)
     return True
 
 
 async def scan_symbol(session, symbol, timeframe):
     try:
-        opens, highs, lows, closes = await get_klines(session, symbol, timeframe, KLINE_LIMIT)
+        opens, highs, lows, closes, volumes = await get_klines(session, symbol, timeframe, KLINE_LIMIT)
         n = len(closes)
         # 멀티 윈도우 스캔: 짧은 → 긴 순서. 첫 감지에서 반환 (쿨다운은 symbol|tf 단위).
         for wlen, lookback in SCAN_WINDOWS:
@@ -362,7 +375,7 @@ async def scan_symbol(session, symbol, timeframe):
             if not result:
                 continue
             # 장대 필터
-            if not check_impulse(highs, lows, n, wlen, result):
+            if not check_impulse(highs, lows, volumes, n, wlen, result):
                 continue
             result["symbol"] = symbol
             result["timeframe"] = timeframe
@@ -467,8 +480,26 @@ def build_embeds(hits_sorted, timeframe, now_str):
         url = f"https://www.gate.io/futures/USDT/{contract}"
         arrow = "⬆" if h.get("impulse_dir") == "up" else "⬇"
         impulse_str = f"{arrow} {h.get('impulse_ratio', 0):.2f}배"
+
+        # 품질 체크 (필터 아님, 표시용)
+        imp_pct = h.get("impulse_pct", 0)
+        vol_r   = h.get("vol_ratio", 0)
+        wlen    = h.get("window", 0)
+        c_imp = "✅" if imp_pct >= QUALITY_IMPULSE_PCT else "❌"
+        c_vol = "✅" if vol_r   >= QUALITY_VOL_RATIO   else "❌"
+        c_win = "✅" if wlen   == QUALITY_SHORT_WINDOW else "❌"
+        score = sum(x == "✅" for x in (c_imp, c_vol, c_win))
+        if score == 3: marker = "🔥"
+        elif score == 2: marker = "👍"
+        elif score == 1: marker = "⚠️"
+        else: marker = "🤔"
+        quality_value = (
+            f"{c_imp} 임펄스 {imp_pct:.1f}% (≥{QUALITY_IMPULSE_PCT:.0f}%)\n"
+            f"{c_vol} 거래량비 {vol_r:.2f}× (≥{QUALITY_VOL_RATIO:.1f}×)\n"
+            f"{c_win} 윈도우 {wlen}봉 (=30)"
+        )
         embeds.append({
-            "title": f"{_display_symbol(contract)} · {h['type']} · {arrow}장대후 수렴",
+            "title": f"{marker} {_display_symbol(contract)} · {h['type']} · {arrow}장대후 수렴",
             "url": url,
             "color": TYPE_COLORS.get(h["type"], 0x95A5A6),
             "fields": [
@@ -478,6 +509,7 @@ def build_embeds(hits_sorted, timeframe, now_str):
                 {"name": "수렴률",     "value": f"{h['compression']*100:.0f}%", "inline": True},
                 {"name": "장대/수렴폭",  "value": impulse_str, "inline": True},
                 {"name": "TF",         "value": timeframe, "inline": True},
+                {"name": f"품질 체크 ({score}/3)", "value": quality_value, "inline": False},
             ],
             "image": {"url": f"attachment://chart_{idx}.png"},
             "footer": {"text": now_str},
