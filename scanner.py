@@ -504,9 +504,6 @@ def build_embeds(hits_sorted, timeframe, now_str):
             "fields": [
                 {"name": "현재가",     "value": f"{h['price']:.6g}", "inline": True},
                 {"name": "범위",       "value": f"{h['lower']:.4g} ~ {h['upper']:.4g}", "inline": True},
-                {"name": "Apex",       "value": f"{h['bars_to_apex']}봉 후", "inline": True},
-                {"name": "수렴률",     "value": f"{h['compression']*100:.0f}%", "inline": True},
-                {"name": "TF",         "value": timeframe, "inline": True},
                 {"name": f"품질 체크 ({score}/3)", "value": quality_value, "inline": False},
             ],
             "image": {"url": f"attachment://chart_{idx}.png"},
