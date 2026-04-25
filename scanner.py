@@ -179,12 +179,13 @@ async def get_klines(session, symbol, timeframe, limit):
     if not data:
         raise RuntimeError("empty klines")
     # Gate.io는 시간순(과거→최신)으로 반환, 객체 배열
+    timestamps = np.array([int(c["t"]) for c in data], dtype=np.int64)
     opens   = np.array([float(c["o"]) for c in data], dtype=float)
     highs   = np.array([float(c["h"]) for c in data], dtype=float)
     lows    = np.array([float(c["l"]) for c in data], dtype=float)
     closes  = np.array([float(c["c"]) for c in data], dtype=float)
     volumes = np.array([float(c.get("v", 0)) for c in data], dtype=float)
-    return opens, highs, lows, closes, volumes
+    return timestamps, opens, highs, lows, closes, volumes
 
 
 # ========== 삼각형 감지 ==========
@@ -361,12 +362,13 @@ def check_impulse(highs, lows, volumes, end_g, wlen, result):
 
 async def scan_symbol(session, symbol, timeframe):
     try:
-        opens, highs, lows, closes, volumes = await get_klines(session, symbol, timeframe, KLINE_LIMIT)
+        timestamps, opens, highs, lows, closes, volumes = await get_klines(session, symbol, timeframe, KLINE_LIMIT)
         n = len(closes)
         # 멀티 윈도우 스캔: 짧은 → 긴 순서. 첫 감지에서 반환 (쿨다운은 symbol|tf 단위).
         for wlen, lookback in SCAN_WINDOWS:
             if n < wlen:
                 continue
+            w_ts     = timestamps[-wlen:]
             w_opens  = opens[-wlen:]
             w_highs  = highs[-wlen:]
             w_lows   = lows[-wlen:]
@@ -380,9 +382,10 @@ async def scan_symbol(session, symbol, timeframe):
             result["symbol"] = symbol
             result["timeframe"] = timeframe
             result["window"] = wlen
-            result["_opens"] = w_opens
-            result["_highs"] = w_highs
-            result["_lows"] = w_lows
+            result["_ts"]     = w_ts
+            result["_opens"]  = w_opens
+            result["_highs"]  = w_highs
+            result["_lows"]   = w_lows
             result["_closes"] = w_closes
             return result
     except Exception as e:
@@ -463,8 +466,36 @@ def render_chart(h) -> bytes:
     y_max = max(highs[visible_slice].max(), upper_line.max())
     pad = (y_max - y_min) * 0.05
     ax.set_ylim(y_min - pad, y_max + pad)
-    ax.set_xlabel("bars")
     ax.set_facecolor("#fafafa")
+
+    # --- X축을 시간(KST)으로 ---
+    ts = h.get("_ts")
+    if ts is not None and len(ts) >= 2:
+        from datetime import datetime, timezone, timedelta
+        kst = timezone(timedelta(hours=9))
+        bar_sec = int(ts[1] - ts[0]) if len(ts) >= 2 else 1800
+        def bar_to_dt(idx):
+            t0 = int(ts[0]) + int(idx) * bar_sec
+            return datetime.fromtimestamp(t0, tz=kst)
+        # 적당히 6~8개 tick
+        xt_lo = max(left, 0)
+        xt_hi = right
+        n_ticks = 7
+        step = max(1, (xt_hi - xt_lo) // n_ticks)
+        ticks = list(range(xt_lo, xt_hi + 1, step))
+        labels = []
+        for t in ticks:
+            d = bar_to_dt(t)
+            # 날짜 바뀌면 MM-DD HH:MM, 같으면 HH:MM
+            labels.append(d.strftime("%m-%d %H:%M") if d.hour == 0 and d.minute < bar_sec/60 else d.strftime("%H:%M"))
+        # 첫 tick은 항상 날짜 포함
+        if ticks:
+            labels[0] = bar_to_dt(ticks[0]).strftime("%m-%d %H:%M")
+        ax.set_xticks(ticks)
+        ax.set_xticklabels(labels, rotation=0, fontsize=8)
+        ax.set_xlabel("KST")
+    else:
+        ax.set_xlabel("bars")
 
     buf = io.BytesIO()
     fig.savefig(buf, format="png", bbox_inches="tight")
