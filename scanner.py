@@ -45,6 +45,9 @@ QUALITY_SHORT_WINDOW = 30       # 짧은 패턴 = 30봉 윈도우
 ALERT_COOLDOWN   = 4 * 3600
 TOP_REFRESH      = 12 * 3600   # top 100 리스트 갱신 주기
 CONCURRENCY      = 5
+CHART_IMPULSE_PAD = 5          # 차트에서 장대 시작점 앞에 남길 여유 봉
+EMBEDS_PER_MESSAGE = 10        # Discord 메시지당 embed 상한
+MAX_ALERTS_PER_RUN = 30        # 한 번 실행에서 보낼 최대 알림 수
 GATE             = "https://api.gateio.ws"
 
 # Gate.io는 소문자 그대로 사용
@@ -185,6 +188,16 @@ async def get_klines(session, symbol, timeframe, limit):
     lows    = np.array([float(c["l"]) for c in data], dtype=float)
     closes  = np.array([float(c["c"]) for c in data], dtype=float)
     volumes = np.array([float(c.get("v", 0)) for c in data], dtype=float)
+
+    # 진행 중인 봉은 종가가 계속 변해 판정이 뒤집히므로 버린다.
+    if len(timestamps) >= 2:
+        bar_sec = int(timestamps[1] - timestamps[0])
+        now_ts = datetime.now(timezone.utc).timestamp()
+        if int(timestamps[-1]) + bar_sec > now_ts:
+            timestamps, opens, highs, lows, closes, volumes = (
+                timestamps[:-1], opens[:-1], highs[:-1],
+                lows[:-1], closes[:-1], volumes[:-1],
+            )
     return timestamps, opens, highs, lows, closes, volumes
 
 
@@ -360,6 +373,18 @@ def check_impulse(highs, lows, volumes, end_g, wlen, result):
     return True
 
 
+def rebase_left(result, pad):
+    """윈도우를 왼쪽으로 pad봉 확장했을 때 로컬 좌표계를 그만큼 이동시킨다.
+    기울기는 그대로, 절편만 옮기면 되므로 upper/lower/bars_to_apex는 불변."""
+    if pad <= 0:
+        return
+    result["hi_intercept"] -= result["hi_slope"] * pad
+    result["lo_intercept"] -= result["lo_slope"] * pad
+    result["piv_hi"] = [i + pad for i in result["piv_hi"]]
+    result["piv_lo"] = [i + pad for i in result["piv_lo"]]
+    result["swing_idx_local"] += pad
+
+
 async def scan_symbol(session, symbol, timeframe):
     try:
         timestamps, opens, highs, lows, closes, volumes = await get_klines(session, symbol, timeframe, KLINE_LIMIT)
@@ -368,25 +393,27 @@ async def scan_symbol(session, symbol, timeframe):
         for wlen, lookback in SCAN_WINDOWS:
             if n < wlen:
                 continue
-            w_ts     = timestamps[-wlen:]
-            w_opens  = opens[-wlen:]
-            w_highs  = highs[-wlen:]
-            w_lows   = lows[-wlen:]
-            w_closes = closes[-wlen:]
-            result = detect_triangle(w_highs, w_lows, w_closes, pivot_lookback=lookback)
+            result = detect_triangle(highs[-wlen:], lows[-wlen:], closes[-wlen:], pivot_lookback=lookback)
             if not result:
                 continue
             # 장대 필터
             if not check_impulse(highs, lows, volumes, n, wlen, result):
                 continue
+
+            # 장대 시작점이 윈도우보다 앞에 있으면 차트에 안 보이므로 왼쪽으로 확장
+            pad = max(0, CHART_IMPULSE_PAD - result["swing_idx_local"])
+            pad = min(pad, n - wlen)
+            rebase_left(result, pad)
+            start = n - wlen - pad
+
             result["symbol"] = symbol
             result["timeframe"] = timeframe
             result["window"] = wlen
-            result["_ts"]     = w_ts
-            result["_opens"]  = w_opens
-            result["_highs"]  = w_highs
-            result["_lows"]   = w_lows
-            result["_closes"] = w_closes
+            result["_ts"]     = timestamps[start:]
+            result["_opens"]  = opens[start:]
+            result["_highs"]  = highs[start:]
+            result["_lows"]   = lows[start:]
+            result["_closes"] = closes[start:]
             return result
     except Exception as e:
         log.warning(f"{symbol} [{timeframe}]: {e}")
@@ -407,9 +434,11 @@ def render_chart(h) -> bytes:
     n = len(closes)
     ext = int(h["bars_to_apex"])
 
-    # 삼각형 구조가 시작된 지점 기준으로 zoom-in
+    # 장대 시작점(있으면)부터 apex까지 보이도록 zoom-in
     first_piv = min(h["piv_hi"][0], h["piv_lo"][0])
-    left = max(0, first_piv - 10)
+    sw_local = h.get("swing_idx_local")
+    anchor = first_piv if sw_local is None else min(first_piv, sw_local)
+    left = max(0, anchor - 3)
     right = n + ext + 2
 
     fig, ax = plt.subplots(figsize=(9, 4.5), dpi=110)
@@ -431,6 +460,18 @@ def render_chart(h) -> bytes:
             (i - width/2, body_lo), width, height,
             facecolor=color, edgecolor=color, linewidth=0.6, zorder=3,
         ))
+
+    # --- 장대(임펄스) 구간 ---
+    if sw_local is not None and 0 <= sw_local < first_piv:
+        up = h.get("impulse_dir") == "up"
+        y_from = h["impulse_low"]  if up else h["impulse_high"]
+        y_to   = h["impulse_high"] if up else h["impulse_low"]
+        ax.axvspan(sw_local, first_piv, color="#f39c12", alpha=0.10, zorder=1)
+        ax.annotate(
+            "", xy=(first_piv, y_to), xytext=(sw_local, y_from),
+            arrowprops=dict(arrowstyle="-|>", color="#e67e22", linewidth=2, alpha=0.85),
+            zorder=5,
+        )
 
     # --- 추세선 (피벗 시작점부터 apex까지만) ---
     line_start = first_piv
@@ -544,8 +585,9 @@ def build_embeds(hits_sorted, timeframe, now_str):
 
 
 async def send_discord_webhook(session, hits, timeframe):
+    """전송에 성공한 hit 리스트를 반환. 실패분은 쿨다운을 찍지 않아 다음 실행에서 재시도된다."""
     if not hits:
-        return
+        return []
     if not WEBHOOK_URL:
         log.info("DISCORD_WEBHOOK_URL 미설정. 콘솔 출력:")
         for h in sorted(hits, key=lambda x: -x["compression"]):
@@ -554,41 +596,57 @@ async def send_discord_webhook(session, hits, timeframe):
                 f"apex={h['bars_to_apex']} comp={h['compression']*100:.0f}% "
                 f"R2={h['hi_r2']:.2f}/{h['lo_r2']:.2f}"
             )
-        return
+        return list(hits)
 
-    hits_sorted = sorted(hits, key=lambda x: -x["compression"])[:10]
+    hits_sorted = sorted(hits, key=lambda x: -x["compression"])[:MAX_ALERTS_PER_RUN]
     now_str = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    content = f"🔺 **Triangle Scan** [{timeframe}] — {len(hits)}건 감지"
-    embeds = build_embeds(hits_sorted, timeframe, now_str)
+    delivered = []
 
-    form = aiohttp.FormData()
-    form.add_field(
-        "payload_json",
-        json.dumps({"content": content, "embeds": embeds}),
-        content_type="application/json",
-    )
-    for idx, h in enumerate(hits_sorted):
-        try:
-            png = render_chart(h)
-        except Exception as e:
-            log.error(f"차트 렌더 실패 {h['symbol']}: {e}")
+    for offset in range(0, len(hits_sorted), EMBEDS_PER_MESSAGE):
+        chunk = hits_sorted[offset : offset + EMBEDS_PER_MESSAGE]
+
+        # 차트 렌더가 실패한 건은 embed에서도 빼야 깨진 이미지가 안 남는다.
+        rendered = []
+        for h in chunk:
+            try:
+                rendered.append((h, render_chart(h)))
+            except Exception as e:
+                log.error(f"차트 렌더 실패 {h['symbol']}: {e}")
+        if not rendered:
             continue
-        form.add_field(
-            f"files[{idx}]",
-            png,
-            filename=f"chart_{idx}.png",
-            content_type="image/png",
-        )
 
-    try:
-        async with session.post(WEBHOOK_URL, data=form, timeout=30) as r:
-            if r.status >= 300:
-                text = await r.text()
-                log.error(f"Discord 전송 실패 {r.status}: {text}")
-            else:
-                log.info(f"Discord 알림 전송: {len(embeds)} embed + 차트")
-    except Exception as e:
-        log.error(f"Discord 전송 예외: {e}")
+        content = (
+            f"🔺 **Triangle Scan** [{timeframe}] — {len(hits)}건 감지"
+            if offset == 0 else f"🔺 (이어서 {offset + 1}~{offset + len(rendered)})"
+        )
+        embeds = build_embeds([h for h, _ in rendered], timeframe, now_str)
+
+        form = aiohttp.FormData()
+        form.add_field(
+            "payload_json",
+            json.dumps({"content": content, "embeds": embeds}),
+            content_type="application/json",
+        )
+        for idx, (_, png) in enumerate(rendered):
+            form.add_field(
+                f"files[{idx}]",
+                png,
+                filename=f"chart_{idx}.png",
+                content_type="image/png",
+            )
+
+        try:
+            async with session.post(WEBHOOK_URL, data=form, timeout=30) as r:
+                if r.status >= 300:
+                    text = await r.text()
+                    log.error(f"Discord 전송 실패 {r.status}: {text}")
+                else:
+                    delivered.extend(h for h, _ in rendered)
+                    log.info(f"Discord 알림 전송: {len(embeds)} embed + 차트")
+        except Exception as e:
+            log.error(f"Discord 전송 예외: {e}")
+
+    return delivered
 
 
 # ========== 메인 ==========
@@ -622,15 +680,17 @@ async def run_once():
             hits = [r for r in results if r]
 
             now = datetime.now(timezone.utc).timestamp()
-            fresh = []
-            for h in hits:
-                key = f"{h['symbol']}|{tf}"
-                if now - cooldowns.get(key, 0) > ALERT_COOLDOWN:
-                    cooldowns[key] = now
-                    fresh.append(h)
+            fresh = [
+                h for h in hits
+                if now - cooldowns.get(f"{h['symbol']}|{tf}", 0) > ALERT_COOLDOWN
+            ]
 
-            log.info(f"[{tf}] 감지 {len(hits)}건 / 신규 알림 {len(fresh)}건")
-            await send_discord_webhook(session, fresh, tf)
+            # 쿨다운은 실제로 전송된 건에만 찍는다.
+            delivered = await send_discord_webhook(session, fresh, tf)
+            for h in delivered:
+                cooldowns[f"{h['symbol']}|{tf}"] = now
+
+            log.info(f"[{tf}] 감지 {len(hits)}건 / 신규 {len(fresh)}건 / 전송 {len(delivered)}건")
 
     save_state({"cooldowns": cooldowns, "top": top})
 
