@@ -1,8 +1,9 @@
 name: Triangle Scan
 
 on:
-  schedule:
-    - cron: "*/15 * * * *"
+  # 자동 스캔 중지 (2026-07 사용자 요청). 재개하려면 아래 두 줄 주석 해제.
+  # schedule:
+  #   - cron: "*/15 * * * *"
   workflow_dispatch:
 
 env:
